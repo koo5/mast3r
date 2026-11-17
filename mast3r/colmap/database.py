@@ -184,12 +184,19 @@ def get_im_matches_from_cache(pairs, cache_path, desc_conf, subsample,
         corres_idx1 = hash_md5(pairs[i][0]['instance'])
         corres_idx2 = hash_md5(pairs[i][1]['instance'])
 
-        path_corres = cache_path + f'/corres_conf={desc_conf}_{subsample=}/{corres_idx1}-{corres_idx2}.pth'
-        if os.path.isfile(path_corres):
-            score, (xy1, xy2, confs) = torch.load(path_corres, map_location=device)
+        # hillview: the cache is read through sparse_ga's codec (.hvz), like every reader
+        from mast3r.cloud_opt import sparse_ga
+        ext = sparse_ga.CACHE_EXT
+        if ext is None:
+            raise sparse_ga._codec_unset('CACHE_EXT')
+        found = sparse_ga._resolve(cache_path + f'/corres_conf={desc_conf}_{subsample=}/{corres_idx1}-{corres_idx2}{ext}')
+        if found is not None:
+            score, (xy1, xy2, confs) = sparse_ga._cache_load(found, device)
         else:
-            path_corres = cache_path + f'/corres_conf={desc_conf}_{subsample=}/{corres_idx2}-{corres_idx1}.pth'
-            score, (xy2, xy1, confs) = torch.load(path_corres, map_location=device)
+            found = sparse_ga._resolve(cache_path + f'/corres_conf={desc_conf}_{subsample=}/{corres_idx2}-{corres_idx1}{ext}')
+            if found is None:
+                raise FileNotFoundError(f'no correspondences for {corres_idx1}-{corres_idx2} in either direction')
+            score, (xy2, xy1, confs) = sparse_ga._cache_load(found, device)
         mask = confs >= conf_thr
         matches_im0 = xy1[mask].cpu().numpy()
         matches_im1 = xy2[mask].cpu().numpy()
