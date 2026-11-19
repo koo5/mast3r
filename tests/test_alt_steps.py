@@ -4,8 +4,13 @@ height_step_down is the GPS gauge's down under gauge_tilt_from 'height_steps': t
 cameras' height steps rise as the terrain's do. alt_step_residual_m is what loss_alt_step sums (through huber_m,
 in that gauge). Checked here: the true down comes back from a mount that is off by degrees; a raised stretch (a
 bridge, an embankment) moves it far less than it moves a fit to absolute heights; a straight track keeps the mounts'
-roll about itself (it cannot see one); no lever arm keeps the mounts' down and says so; the term is zero on the
-terrain and its gradient reaches only the ends of the steps."""
+roll about itself (it cannot see one); a short, steadily turning piece whose solved trail bends against the DEM keeps
+the mounts' roll at the floor a step is credited with, and takes a roll from the bend at a floor of a centimetre; no
+lever arm keeps the mounts' down and says so; the term is zero on the terrain and its gradient reaches only the ends
+of the steps.
+
+FLOOR is the accuracy the caller credits a terrain step with at best (its default); FINE a centimetre, the floor the
+fit once had, at which the residuals the tilt absorbs set the prior's weight."""
 import inspect
 import math
 import sys
@@ -20,6 +25,8 @@ from mast3r.cloud_opt.sparse_ga import (alt_step_residual_m, gps_gauge, height_s
                                         weighted_sim3)
 
 DOWN = torch.tensor([0.0, 0.0, -1.0], dtype=torch.float64)
+FLOOR = 0.2
+FINE = 0.01
 
 
 def rot(axis, deg):
@@ -73,10 +80,15 @@ def test_the_true_down_comes_back_from_a_mount_off_by_degrees():
     li, lj = links(len(enu))
     for axis in ([1.0, 0, 0], [0, 1.0, 0], [0.5, 0.5, 0.2]):
         g0 = rot(axis, 3.0) @ g_true                      # the mounts' mean, pitched and rolled by the grade
-        g, info = height_step_down(c, enu, w, li, lj, g0, 0.5, 3.0)
+        g, info = height_step_down(c, enu, w, li, lj, g0, 0.5, 3.0, FINE)
         # the cameras' 3 cm bounce allows about a tenth of a degree (0.01-0.12 over seeds 0-4)
         assert deg(g, g_true) < 0.2, (axis, deg(g, g_true), info)
         assert info['why'] is None and info['beyond_knee'] == 0 and 0.01 <= info['sigma_z_m'] < 0.1, info
+        # credited with FLOOR, the steps still take the mounts' 3 deg away on this 40-fix turning ride: what stays is
+        # the share the mounts' prior keeps of the direction the ride sees worse (0.05-0.34 deg over the three axes)
+        g, info = height_step_down(c, enu, w, li, lj, g0, 0.5, 3.0, FLOOR)
+        assert deg(g, g_true) < 0.45, (axis, deg(g, g_true), info)
+        assert info['sigma_z_m'] == FLOOR, info
 
 
 def test_a_raised_stretch_moves_the_steps_far_less_than_absolute_heights():
@@ -88,14 +100,15 @@ def test_a_raised_stretch_moves_the_steps_far_less_than_absolute_heights():
     c, g_true = model_of(cam, Q)
     w = torch.full((len(enu),), 1.0 / len(enu), dtype=torch.float64)
     li, lj = links(len(enu))
-    g, info = height_step_down(c, enu, w, li, lj, rot([1, 0, 0], 2.0) @ g_true, 0.5, 3.0)
     _s, R, _t = weighted_sim3(c, enu, w)                  # absolute heights choose the tilt
     g_abs = R.T @ DOWN
-    assert info['beyond_knee'] == 2, info
-    # the Huber caps the two steps' pull, it does not zero it: on a turning road they leave 0.27-0.44 deg (seeds 0-4)
-    # where absolute heights leave 2.4-2.5
-    assert deg(g, g_true) < 0.25 * deg(g_abs, g_true), (deg(g, g_true), deg(g_abs, g_true))
-    assert deg(g, g_true) < 0.6
+    for floor, bound in ((FINE, 0.6), (FLOOR, 0.35)):
+        g, info = height_step_down(c, enu, w, li, lj, rot([1, 0, 0], 2.0) @ g_true, 0.5, 3.0, floor)
+        assert info['beyond_knee'] == 2, info
+        # the Huber caps the two steps' pull, it does not zero it: on a turning road they leave 0.27-0.44 deg at FINE
+        # (seeds 0-4), 0.22 at FLOOR, where absolute heights leave 2.4-2.5
+        assert deg(g, g_true) < 0.25 * deg(g_abs, g_true), (floor, deg(g, g_true), deg(g_abs, g_true))
+        assert deg(g, g_true) < bound, (floor, deg(g, g_true))
 
 
 def test_a_straight_track_keeps_the_mounts_roll_about_it():
@@ -107,17 +120,48 @@ def test_a_straight_track_keeps_the_mounts_roll_about_it():
     along = Q.T @ torch.tensor([1.0, 0, 0], dtype=torch.float64)    # the road's direction in the model
     across = Q.T @ torch.tensor([0, 1.0, 0], dtype=torch.float64)
     g0 = rot(along, 2.0) @ rot(across, 3.0) @ g_true                  # rolled 2 deg, pitched 3 deg
-    g, info = height_step_down(c, enu, w, li, lj, g0, 0.5, 3.0)
+    g, info = height_step_down(c, enu, w, li, lj, g0, 0.5, 3.0, FLOOR)
     assert info['seen'] < 1e-6, info
     def pitch(x):
         return math.degrees(math.atan2(float(x @ along), float(x @ g_true)))
 
     def roll(x):
         return math.degrees(math.atan2(float(x @ across), float(x @ g_true)))
-    assert abs(pitch(g) - pitch(g_true)) < 0.05, (pitch(g), pitch(g_true), pitch(g0))
-    # the roll stays the mounts' within a tenth of their own 3 deg (0.2-0.4 deg over seeds 0-4: a roll changes each
-    # rise by 1 - cos, which the bounce hides)
+    # 40 steps carry the pitch at FLOOR too (0.05 deg left of 3)
+    assert abs(pitch(g) - pitch(g_true)) < 0.1, (pitch(g), pitch(g_true), pitch(g0))
+    # the roll stays the mounts' within a tenth of their own 3 deg (a roll changes each rise by 1 - cos, which the
+    # bounce hides)
     assert abs(roll(g) - roll(g0)) < 0.5, (roll(g), roll(g0))
+
+
+def test_a_short_turning_piece_bent_against_the_dem_keeps_the_mounts_roll():
+    """seven fixes ~9.5 m apart on a road turning steadily right by 15 deg, the solved trail bent against the DEM (its
+    height steps off the terrain's by a trend climbing -0.34 -> +0.34 m), the mounts pitched 3 deg and not rolled.
+    The bend grows along the piece as the turn does, so a roll fits it; at FINE the residuals it leaves read 2.5 cm
+    and the mounts' prior holds nothing: a 14.9 deg roll. Credited with FLOOR, the roll stays within 4 deg of the
+    mounts' and the pitch is still taken from the steps (0.68 of 3 deg left)."""
+    n = 7
+    head = np.radians(-np.linspace(0.0, 15.0, n - 1))
+    xy = np.vstack([np.zeros(2), np.cumsum(9.5 * np.c_[np.cos(head), np.sin(head)], 0)])
+    enu = torch.as_tensor(np.c_[xy, -0.006 * np.r_[0.0, np.cumsum(np.full(n - 1, 9.5))]], dtype=torch.float64)
+    cam = enu.clone()
+    cam[1:, 2] += torch.as_tensor(np.cumsum(np.linspace(-0.34, 0.34, n - 1)), dtype=torch.float64)
+    cam[:, 2] += torch.as_tensor(np.random.default_rng(3).normal(0.0, 0.02, n), dtype=torch.float64)
+    c, g_true = model_of(cam, Q)
+    w = torch.full((n,), 1.0 / n, dtype=torch.float64)
+    li, lj = links(n)
+    along = Q.T @ torch.tensor([1.0, 0, 0], dtype=torch.float64)
+    across = Q.T @ torch.tensor([0, 1.0, 0], dtype=torch.float64)
+    g0 = rot(across, 3.0) @ g_true
+
+    def lean(x, axis):
+        return math.degrees(math.atan2(float(x @ axis), float(x @ g_true)))
+    g_fine, info_fine = height_step_down(c, enu, w, li, lj, g0, 0.5, 3.0, FINE)
+    g, info = height_step_down(c, enu, w, li, lj, g0, 0.5, 3.0, FLOOR)
+    assert abs(lean(g_fine, across)) > 10.0, (lean(g_fine, across), info_fine)
+    assert abs(lean(g, across)) < 4.5, (lean(g, across), info)
+    assert abs(lean(g, along)) < 1.0 < abs(lean(g0, along)), (lean(g, along), lean(g0, along))
+    assert info['sigma_z_m'] == FLOOR and info_fine['sigma_z_m'] < 0.05, (info, info_fine)
 
 
 def test_a_warm_start_reaches_the_same_down_in_fewer_steps():
@@ -127,8 +171,8 @@ def test_a_warm_start_reaches_the_same_down_in_fewer_steps():
     w = torch.full((len(enu),), 1.0 / len(enu), dtype=torch.float64)
     li, lj = links(len(enu))
     g0 = rot([0.5, 0.5, 0.2], 3.0) @ g_true
-    g, info = height_step_down(c, enu, w, li, lj, g0, 0.5, 3.0)
-    g2, info2 = height_step_down(c, enu, w, li, lj, g0, 0.5, 3.0, g_start=g)
+    g, info = height_step_down(c, enu, w, li, lj, g0, 0.5, 3.0, FLOOR)
+    g2, info2 = height_step_down(c, enu, w, li, lj, g0, 0.5, 3.0, FLOOR, g_start=g)
     assert deg(g2, g) < 1e-5, deg(g2, g)
     assert info2['iters'] <= 2 < info['iters'], (info['iters'], info2['iters'])
 
@@ -138,8 +182,21 @@ def test_no_lever_arm_keeps_the_mounts_down_and_says_so():
     c = torch.zeros(6, 3, dtype=torch.float64) + 1.0
     w = torch.full((6,), 1.0 / 6, dtype=torch.float64)
     g0 = torch.tensor([0.1, 0.9, 0.2], dtype=torch.float64)
-    g, info = height_step_down(c, enu, w, *links(6), g0, 0.5, 3.0)
+    g, info = height_step_down(c, enu, w, *links(6), g0, 0.5, 3.0, FLOOR)
     assert torch.allclose(g, g0 / g0.norm()) and info['why'] and info['iters'] == 0
+
+
+def test_a_floor_that_is_not_positive_is_refused():
+    enu = ride(n=6)
+    c, _g = model_of(enu, Q)
+    w = torch.full((6,), 1.0 / 6, dtype=torch.float64)
+    for bad in (0.0, -0.1, float('nan')):
+        try:
+            height_step_down(c, enu, w, *links(6), DOWN, 0.5, 3.0, bad)
+        except ValueError as e:
+            assert 'floor_m' in str(e), e
+        else:
+            raise AssertionError(f'floor_m {bad!r} was taken')
 
 
 def test_the_step_term_is_zero_on_the_terrain_and_reaches_only_step_ends():
@@ -169,3 +226,8 @@ def test_the_optimiser_takes_the_steps_with_the_old_behaviour_by_default():
                          ('alt_step_huber_m', 0.5), ('gauge_tilt_mount_sd_deg', 3.0)):
         assert p[name].default == legacy, name
     assert sparse_ga.ALT_STEPS is True
+    # the floor has no default: under 'height_steps' the caller names it (refused when it does not)
+    assert p['gauge_tilt_step_floor_m'].default is None
+    assert sparse_ga.GAUGE_TILT_STEP_FLOOR is True
+    assert 'floor_m' in inspect.signature(height_step_down).parameters
+    assert inspect.signature(height_step_down).parameters['floor_m'].default is inspect.Parameter.empty

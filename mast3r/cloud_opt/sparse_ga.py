@@ -757,13 +757,7 @@ def weighted_sim3_vertical(src, dst, w, g_src):
     return s, R, mu_d - s * (Rz @ mu_p)
 
 
-# No step's height change is known to better than this: the DEM's grid between two fixes and the rider's bounce. Below
-# it the mounts' prior would weigh nothing, and a tilt the steps see only at second order (a roll about a straight
-# road changes each rise by 1 - cos) would be taken from them.
-STEP_SIGMA_FLOOR_M = 0.01
-
-
-def height_step_down(c, enu, w, li, lj, g0, knee_m, mount_sd_deg, g_start=None, iters=20, tol_rad=1e-9):
+def height_step_down(c, enu, w, li, lj, g0, knee_m, mount_sd_deg, floor_m, g_start=None, iters=20, tol_rad=1e-9):
     """The model's DOWN from the camera centres' HEIGHT STEPS (hillview): what should be constrained is the altitude
     delta.
 
@@ -775,17 +769,28 @@ def height_step_down(c, enu, w, li, lj, g0, knee_m, mount_sd_deg, g_start=None, 
 
     THE FIT IS THE MOUNTS' DOWN g0 CORRECTED BY THE STEPS, each weighed by what it knows. The mounts' down is off the
     vertical by about mount_sd_deg (one sigma); the steps scatter by sigma_z metres, measured on their own residuals
-    (1.4826 x the median, at least STEP_SIGMA_FLOOR_M, every iteration). So the correction (a, b) in g0's tangent
-    plane minimises Huber(step residuals) + (sigma_z / mount_sd)^2 |(a, b)|^2 / 2: Gauss-Newton with IRLS, s re-read
-    from the horizontal fit at each g. A tilt the steps see well moves to them; one they barely see -- a roll about a
+    (1.4826 x the median, every iteration) but never below floor_m. So the correction (a, b) in g0's tangent plane
+    minimises Huber(step residuals) + (sigma_z / mount_sd)^2 |(a, b)|^2 / 2: Gauss-Newton with IRLS, s re-read from
+    the horizontal fit at each g. A tilt the steps see well moves to them; one they barely see -- a roll about a
     straight road -- stays the mounts'. An earlier cut held each direction by a FIXED share (1 %) of the best-seen
     one's information, which kept 0.15 deg of a 3 deg correction on a turning ride whose steps fit to 3 mm.
 
+    THE FLOOR is what keeps that promise. The residuals are measured after the fit has spent its two tilt directions
+    on them, so they cannot show an error the tilt absorbs: on a few steps of a gently turning road, a vertical bend
+    of the solved trail against the DEM reads as a roll (the bend grows along the piece as the road's turn does), the
+    residuals then fall to centimetres, and a floor that low leaves the mounts' prior weighing nothing in the direction
+    the steps see worst. floor_m is the accuracy a terrain step is credited with at best (the DEM between two fixes,
+    the fixes' own horizontal error across a sloping road, the mount's height); above every residual scatter a long
+    piece shows, it leaves the along-the-road correction to the steps and the roll to the mounts.
+
     c (n, 3) model-frame centres; enu (n, 3) their fixes in ENU metres (heights read on linked rows only); w (n,) the
-    horizontal fit's weights; li, lj the linked rows. g_start: where to start (the group's last answer: the gauge is
+    horizontal fit's weights; li, lj the linked rows; floor_m > 0. g_start: where to start (the group's last answer: the gauge is
     refitted every iteration and moves little, so the fit stops in a step or two instead of running all `iters`);
     the prior stays centred on g0 either way. Stops when a step moves the down by less than
     tol_rad. -> (g, info). Called under no_grad: a gauge."""
+    floor_m = float(floor_m)
+    if not floor_m > 0:
+        raise ValueError(f'height_step_down: floor_m must be > 0, not {floor_m!r}')
     dt = torch.float64
     c, w = c.to(dt), w.to(dt)
     flat = torch.cat([enu[:, :2].to(dt), torch.zeros_like(enu[:, :1], dtype=dt)], 1)   # s reads the horizontal only
@@ -823,7 +828,7 @@ def height_step_down(c, enu, w, li, lj, g0, knee_m, mount_sd_deg, g_start=None, 
                 return g0, dict(off_deg=0.0, seen=0.0, iters=0, sigma_z_m=sig, resid_med_m=float('nan'),
                                 beyond_knee=0, why='the steps see no tilt (no lever arm)')
             seen = float(ev[0] / ev[-1])
-        sig = max(1.4826 * float(a.median()), STEP_SIGMA_FLOOR_M)
+        sig = max(1.4826 * float(a.median()), floor_m)
         lam = sig * sig * prior
         step = torch.linalg.solve(A + lam * I2, -(J.T @ (hw * r)) - lam * th)
         th = th + step
@@ -1193,6 +1198,7 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
                            weak_mid_frac=0.0, weak_mid_huber_m=1.0,  # hillview: a weak camera pulled to its neighbours' midpoint, the neighbours detached
                            alt_step_links=None, gauge_tilt_from='mount',  # hillview: consecutive photographs' stand-ins (i, j) whose heights are one DEM's; 'height_steps' = the GPS gauge's down from their height steps
                            gauge_tilt_mount_sd_deg=3.0,  # hillview: ...and how far the mounts' mean down may sit off the vertical (one sigma), the prior the steps correct
+                           gauge_tilt_step_floor_m=None,  # hillview: ...and the accuracy a terrain step is credited with at best, metres (height_step_down's floor_m); required under 'height_steps'
                            alt_step_frac=0.0, alt_step_huber_m=0.5,  # hillview: ...and those steps' solved height changes held to the terrain's, as a FRACTION of the pixel term at one knee per step
                            pair_steps=None, pair_step_w=0.0, pair_step_huber=0.5, pair_step_depth_scale=True, pair_step_dir_only=False, pair_step_len_sep=0, pair_step_len_only=False,  # hillview: the pairs' own step beliefs in the objective
                            pose_init='pile',  # hillview: where the cameras START (pose_init.py): 'pile' (upstream), 'visual', 'gps'
@@ -2390,6 +2396,9 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
             if _imu_idx is None:
                 raise ValueError('gauge_tilt_from height_steps corrects the mounts\' down and there is none: it needs '
                                  'imu_down on >= 3 views and gauge_gravity')
+            if gauge_tilt_step_floor_m is None or not float(gauge_tilt_step_floor_m) > 0:
+                raise ValueError(f'gauge_tilt_from height_steps needs gauge_tilt_step_floor_m > 0 from the caller, '
+                                 f'not {gauge_tilt_step_floor_m!r}')
             short = [gi for gi in range(len(_gps_groups)) if gi not in _alt_of or len(_alt_of[gi][0]) < 3]
             if short:
                 raise ValueError(f'gauge_tilt_from height_steps: GPS group(s) {short} hold fewer than 3 altitude steps, '
@@ -2397,7 +2406,8 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
             _gps_groups = [(sel, enu_, w_, torch.zeros_like(z_)) for sel, enu_, w_, z_ in _gps_groups]
             print(f' >> gauge tilt from HEIGHT STEPS: each group\'s down is the mounts\' (one sigma '
                   f'{gauge_tilt_mount_sd_deg} deg) corrected so its steps rise as the terrain does (huber '
-                  f'{alt_step_huber_m} m); the GPS term holds positions HORIZONTALLY, heights enter as steps only')
+                  f'{alt_step_huber_m} m, a step credited with {float(gauge_tilt_step_floor_m):g} m at best); the GPS term '
+                  f'holds positions HORIZONTALLY, heights enter as steps only')
         if alt_step_frac:
             print(f' >> alt_step: {_n_alt} step(s) held to the terrain\'s height change, huber {alt_step_huber_m} m, '
                   f'{alt_step_frac:.0%} of the pixel objective at one knee per step'
@@ -2665,7 +2675,8 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
                                            'whose mounts it corrects')
                     li, lj, _dz = _alt_of[gi]
                     g_, info = height_step_down(c.detach(), enu, w, li, lj, g_, float(alt_step_huber_m),
-                                              float(gauge_tilt_mount_sd_deg), g_start=_alt_last.get(gi))
+                                              float(gauge_tilt_mount_sd_deg), float(gauge_tilt_step_floor_m),
+                                              g_start=_alt_last.get(gi))
                     _alt_last[gi] = g_
                     n_ = _alt_fits.get(gi, 0)
                     _alt_fits[gi] = n_ + 1
@@ -4267,6 +4278,10 @@ WEAK_HOLDS = True
 # alt_step_frac / alt_step_huber_m (each step's solved height change held to the terrain's). The caller refuses a
 # checkout without it.
 ALT_STEPS = True
+# hillview: height_step_down takes floor_m, and sparse_scene_optimizer gauge_tilt_step_floor_m (required under
+# 'height_steps'): the accuracy a terrain step is credited with at best, so the residuals the tilt fit has absorbed
+# cannot lower it. The caller refuses a checkout without it.
+GAUGE_TILT_STEP_FLOOR = True
 # hillview: sparse_scene_optimizer takes `restore`, a finished run's final state in
 # place of the two stages, checked against this run's inputs (a dense arm, --solve_from). The caller refuses a checkout
 # without it.
